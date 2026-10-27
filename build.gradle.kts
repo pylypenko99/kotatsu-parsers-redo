@@ -7,8 +7,8 @@ plugins {
     alias(libs.plugins.ksp)
 }
 
-group = "org.koitharu"
-version = "1.0"
+group = "com.github.clquwu"
+version = "dc223c3d80"
 
 tasks.test {
     useJUnitPlatform()
