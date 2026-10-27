@@ -18,15 +18,45 @@ internal class WaMangaParser(
 
 	override val configKeyDomain = ConfigKey.Domain("wamanga.ru")
 
-	// The API returns the catalog in alphabetical order; no server-side sorting.
-	override val availableSortOrders: Set<SortOrder> = EnumSet.of(SortOrder.ALPHABETICAL)
+	// Swagger spec (https://wamanga.ru/api/docs): sortKey enum =
+	// createdAt | updatedAt | publicDate | views | likes | alphabetical | chapters,
+	// direction via boolean sortDescending. All verified against the live API.
+	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
+		SortOrder.ALPHABETICAL,
+		SortOrder.ALPHABETICAL_DESC,
+		SortOrder.POPULARITY,		// views desc
+		SortOrder.POPULARITY_ASC,	// views asc
+		SortOrder.RATING,			// likes desc (closest to rating the API has)
+		SortOrder.RATING_ASC,		// likes asc
+		SortOrder.NEWEST,			// createdAt desc
+		SortOrder.NEWEST_ASC,		// createdAt asc
+		SortOrder.UPDATED,			// updatedAt desc
+		SortOrder.UPDATED_ASC,		// updatedAt asc
+		SortOrder.ADDED,			// publicDate desc (site's own publication date)
+		SortOrder.ADDED_ASC,		// publicDate asc
+	)
 
 	override val filterCapabilities: MangaListFilterCapabilities
 		get() = MangaListFilterCapabilities(
 			isSearchSupported = true,
+			isSearchWithFiltersSupported = true,
+			isMultipleTagsSupported = true,
 		)
 
-	override suspend fun getFilterOptions() = MangaListFilterOptions()
+	// The API has no genres listing endpoint (GET /genres -> 404) and the catalog
+	// tag data is messy (300+ typo/split variants like "Фэтези", "Боевые" + "искусства"),
+	// so a curated list of canonical genres is used instead.
+	// Every entry is verified to work with the `genres` query parameter
+	// (server filters by exact string match, multiple genres are AND-combined).
+	override suspend fun getFilterOptions() = MangaListFilterOptions(
+		availableTags = AVAILABLE_GENRES.mapNotNullToSet { name ->
+			MangaTag(
+				title = name,
+				key = name,
+				source = source,
+			)
+		},
+	)
 
 	private fun apiUrl() = "https://${domain}/api/v1"
 
@@ -42,6 +72,33 @@ internal class WaMangaParser(
 				append("&query=")
 				append(it.urlEncoded())
 			}
+			if (filter.tags.isNotEmpty()) {
+				append("&genres=")
+				append(filter.tags.joinToString(separator = ",") { it.key }.urlEncoded())
+			}
+			// Server-side sorting (Swagger: sortKey + sortDescending).
+			// Kotatsu convention: UPDATED/POPULARITY/RATING/NEWEST/ADDED = descending
+			// (best/first items first), *_ASC = ascending, ALPHABETICAL = A→Z (ascending).
+			data class SortSpec(val key: String, val desc: Boolean)
+			val spec = when (order) {
+				SortOrder.ALPHABETICAL -> SortSpec("alphabetical", desc = false)
+				SortOrder.ALPHABETICAL_DESC -> SortSpec("alphabetical", desc = true)
+				SortOrder.POPULARITY -> SortSpec("views", desc = true)
+				SortOrder.POPULARITY_ASC -> SortSpec("views", desc = false)
+				SortOrder.RATING -> SortSpec("likes", desc = true)
+				SortOrder.RATING_ASC -> SortSpec("likes", desc = false)
+				SortOrder.NEWEST -> SortSpec("createdAt", desc = true)
+				SortOrder.NEWEST_ASC -> SortSpec("createdAt", desc = false)
+				SortOrder.UPDATED -> SortSpec("updatedAt", desc = true)
+				SortOrder.UPDATED_ASC -> SortSpec("updatedAt", desc = false)
+				SortOrder.ADDED -> SortSpec("publicDate", desc = true)
+				SortOrder.ADDED_ASC -> SortSpec("publicDate", desc = false)
+				else -> SortSpec("alphabetical", desc = false)
+			}
+			append("&sortKey=")
+			append(spec.key)
+			append("&sortDescending=")
+			append(spec.desc)
 		}
 		return webClient.httpGet(url).parseJsonArray().mapJSON { parseManga(it) }
 	}
@@ -144,5 +201,21 @@ internal class WaMangaParser(
 		"abandoned" -> MangaState.ABANDONED
 		"paused", "frozen" -> MangaState.PAUSED
 		else -> null
+	}
+
+	private companion object {
+		private val AVAILABLE_GENRES = listOf(
+			"16+", "18+", "Антигерой", "Апокалипсис", "Артефакты", "Боевик", "Боевые искусства",
+			"Бои на мечах", "Боги", "Борьба за власть", "Брат и сестра", "Волшебные существа",
+			"Волшебники / маги", "Воспоминания из другого мира", "ГГ женщина", "ГГ мужчина",
+			"ГГ имба", "Гарем", "Горничные", "Демоны", "Драконы", "Драма", "Дружба", "Жестокий мир",
+			"Зверолюди", "Игра", "Игровые элементы", "Империи", "История", "Исекай", "Комедия",
+			"Магия", "Манга", "Месть", "Мистика", "Монстры", "Мурим", "Навыки / способности",
+			"Наёмники", "Насилие", "Насилие / жестокость", "Отношения", "Психология",
+			"Путешествие во времени", "Ранги силы", "Реинкарнация", "Романтика",
+			"Сверхъестественное", "Сёдзё", "Сёнэн", "Сэйнэн", "Система", "Скрытие личности",
+			"Спорт", "Спортивное тело", "Средневековье", "Трагедия", "Триллер", "Ужасы",
+			"Умный ГГ", "Фантастика", "Фэнтези", "Хентай", "Холодное оружие", "Школа", "Эротика", "Этти",
+		)
 	}
 }
