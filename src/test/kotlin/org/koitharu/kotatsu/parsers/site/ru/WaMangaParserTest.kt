@@ -8,6 +8,7 @@ import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.CsvSource
@@ -95,18 +96,20 @@ internal class WaMangaParserTest {
 		assertEquals("Драма".toTitleCase(), option.title)
 	}
 
+	// Each test uses its own upload id: probe results are cached per URL on the parser
+	// class level (they are deterministic in production), so ids must not overlap.
 	@org.junit.jupiter.api.Test
 	fun deadCoverFallsBackToLiveBanner() = runTest {
 		val parser = WaMangaParser(
 			TestContext(
-				{ path -> if (path == "/api/v1/manga") COVER_JSON else error("Unexpected request: $path") },
+				{ path -> if (path == "/api/v1/manga") coverJson("probe-list-banner") else error("Unexpected request: $path") },
 				headStatus = { url -> if (url.endsWith("cover.webp")) 404 else 200 },
 			),
 		)
 
 		val manga = parser.getListPage(1, SortOrder.UPDATED, MangaListFilter.EMPTY).single()
 
-		assertEquals("https://wamanga.ru/app/uploads/dead1/banner.webp", manga.coverUrl)
+		assertEquals("https://wamanga.ru/app/uploads/probe-list-banner/banner.webp", manga.coverUrl)
 		assertEquals(manga.coverUrl, manga.largeCoverUrl)
 	}
 
@@ -114,7 +117,7 @@ internal class WaMangaParserTest {
 	fun deadCoverWithoutLiveBannerIsNulls() = runTest {
 		val parser = WaMangaParser(
 			TestContext(
-				{ path -> if (path == "/api/v1/manga") COVER_JSON else error("Unexpected request: $path") },
+				{ path -> if (path == "/api/v1/manga") coverJson("probe-list-none") else error("Unexpected request: $path") },
 				headStatus = { 404 },
 			),
 		)
@@ -127,14 +130,14 @@ internal class WaMangaParserTest {
 
 	@org.junit.jupiter.api.Test
 	fun deadBannerFallsBackToCoverInDetails() = runTest {
-		val detailsJson = COVER_JSON.removePrefix("[").removeSuffix("]")
+		val detailsJson = coverJson("probe-details").removePrefix("[").removeSuffix("]")
 		val parser = WaMangaParser(
 			TestContext(
 				{ path ->
 					when (path) {
-						"/api/v1/manga" -> COVER_JSON
-						"/api/v1/manga/dead1" -> detailsJson
-						"/api/v1/manga/dead1/chapters" -> "[]"
+						"/api/v1/manga" -> coverJson("probe-details")
+						"/api/v1/manga/probe-details" -> detailsJson
+						"/api/v1/manga/probe-details/chapters" -> "[]"
 						else -> error("Unexpected request: $path")
 					}
 				},
@@ -145,13 +148,36 @@ internal class WaMangaParserTest {
 
 		val details = parser.getDetails(listed)
 
-		assertEquals("https://wamanga.ru/app/uploads/dead1/cover.webp", details.largeCoverUrl)
+		assertEquals("https://wamanga.ru/app/uploads/probe-details/cover.webp", details.largeCoverUrl)
 		assertEquals(details.coverUrl, details.largeCoverUrl)
 	}
 
-	private val COVER_JSON =
-		"""[{"id":"dead1","slug":"sample-title","title":"Sample title","type":"manga",""" +
-			""""coverUrl":"/app/uploads/dead1/cover.webp","imageUrl":"/app/uploads/dead1/banner.webp"}]"""
+	@org.junit.jupiter.api.Test
+	fun probesAreCachedForRepeatedLoads() = runTest {
+		val heads = mutableListOf<String>()
+		val parser = WaMangaParser(
+			TestContext(
+				{ path -> if (path == "/api/v1/manga") coverJson("probe-cache") else error("Unexpected request: $path") },
+				headStatus = { url ->
+					heads.add(url)
+					if (url.endsWith("cover.webp")) 404 else 200
+				},
+			),
+		)
+
+		val first = parser.getListPage(1, SortOrder.UPDATED, MangaListFilter.EMPTY).single()
+		assertEquals("https://wamanga.ru/app/uploads/probe-cache/banner.webp", first.coverUrl)
+		val headsAfterFirst = heads.size
+		assertNotEquals(0, headsAfterFirst)
+
+		parser.getListPage(1, SortOrder.UPDATED, MangaListFilter.EMPTY)
+
+		assertEquals(headsAfterFirst, heads.size, "repeated load must reuse cached probe results")
+	}
+
+	private fun coverJson(id: String) =
+		"""[{"id":"$id","slug":"sample-title","title":"Sample title","type":"manga",""" +
+			""""coverUrl":"/app/uploads/$id/cover.webp","imageUrl":"/app/uploads/$id/banner.webp"}]"""
 
 	private class TestContext(
 		private val responder: (path: String) -> String,

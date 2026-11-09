@@ -17,6 +17,7 @@ import org.koitharu.kotatsu.parsers.util.*
 import org.koitharu.kotatsu.parsers.util.json.*
 import java.text.SimpleDateFormat
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 
 @MangaSourceParser("WAMANGA", "WaManga", "ru", type = ContentType.MANGA)
 internal class WaMangaParser(
@@ -134,19 +135,27 @@ internal class WaMangaParser(
 		}.awaitAll()
 	}
 
+	// Files never reappear once gone, so a probe result holds for the whole process life.
+	// Kept on the class (not the instance): the app caches repositories behind
+	// WeakReferences, so scrolling covers can silently replace the parser instance and
+	// an instance-level cache would make every re-entry re-probe all covers again.
 	private suspend fun Manga.withAvailableCover(): Manga {
 		val cover = coverUrl
-		if (cover != null && doesFileExist(cover)) {
+		if (cover == null) {
+			return this
+		}
+		if (existsOrProbe(cover)) {
 			return this
 		}
 		val banner = largeCoverUrl?.takeIf { it != cover }
-		if (banner != null && doesFileExist(banner)) {
+		if (banner != null && existsOrProbe(banner)) {
 			return copy(coverUrl = banner, largeCoverUrl = banner)
 		}
-		if (cover == null && banner == null) {
-			return this
-		}
 		return copy(coverUrl = null, largeCoverUrl = null)
+	}
+
+	private suspend fun existsOrProbe(url: String): Boolean = probeResults[url] ?: doesFileExist(url).also {
+		probeResults[url] = it
 	}
 
 	private suspend fun doesFileExist(url: String): Boolean = runCatching {
@@ -248,6 +257,11 @@ internal class WaMangaParser(
 	}
 
 	private companion object {
+
+		// URL -> file exists. Dead files never come back, so entries are trusted forever;
+		// the map is tiny (≤2 entries per title, ~2500 titles in the catalog).
+		private val probeResults = ConcurrentHashMap<String, Boolean>()
+
 		val GENRES: Set<String> = setOf(
 			"16+", "18+", "Алхимия", "Антигерой",
 			"Апокалипсис", "Аристократия", "Армия", "Артефакты",
