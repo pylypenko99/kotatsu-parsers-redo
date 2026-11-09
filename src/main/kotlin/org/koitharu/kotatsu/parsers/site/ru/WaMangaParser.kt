@@ -1,5 +1,12 @@
 package org.koitharu.kotatsu.parsers.site.ru
 
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import org.jsoup.HttpStatusException
+import org.koitharu.kotatsu.parsers.exception.NotFoundException
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
@@ -90,7 +97,8 @@ internal class WaMangaParser(
 				append("&releaseYearTo=").append(yearTo)
 			}
 		}
-		return webClient.httpGet(url).parseJsonArray().mapJSON { parseManga(it) }
+		val list = webClient.httpGet(url).parseJsonArray().mapJSON { parseManga(it) }
+		return resolveCovers(list)
 	}
 
 	private fun parseManga(jo: JSONObject): Manga {
@@ -116,6 +124,41 @@ internal class WaMangaParser(
 		)
 	}
 
+	// The site's file storage has lost about a third of the uploads: cover.webp 404s
+	// permanently, and banner.webp died with it in most cases. Probe which files exist
+	// and keep whatever is available instead of URLs that only render 404 placeholders.
+	private suspend fun resolveCovers(list: List<Manga>): List<Manga> = coroutineScope {
+		val semaphore = Semaphore(COVER_PROBE_CONCURRENCY)
+		list.map { manga ->
+			async { semaphore.withPermit { manga.withAvailableCover() } }
+		}.awaitAll()
+	}
+
+	private suspend fun Manga.withAvailableCover(): Manga {
+		val cover = coverUrl
+		if (cover != null && doesFileExist(cover)) {
+			return this
+		}
+		val banner = largeCoverUrl?.takeIf { it != cover }
+		if (banner != null && doesFileExist(banner)) {
+			return copy(coverUrl = banner, largeCoverUrl = banner)
+		}
+		if (cover == null && banner == null) {
+			return this
+		}
+		return copy(coverUrl = null, largeCoverUrl = null)
+	}
+
+	private suspend fun doesFileExist(url: String): Boolean = runCatching {
+		webClient.httpHead(url).use { response -> response.code in 200..299 }
+	}.recoverCatching { error ->
+		when (error) {
+			is NotFoundException -> false
+			is HttpStatusException -> false
+			else -> throw error
+		}
+	}.getOrDefault(false)
+
 	override suspend fun getDetails(manga: Manga): Manga {
 		val jo = webClient.httpGet("${apiUrl()}/manga/${manga.url}").parseJson()
 		val chaptersJson = webClient.httpGet("${apiUrl()}/manga/${manga.url}/chapters").parseJsonArray()
@@ -125,7 +168,7 @@ internal class WaMangaParser(
 			?.filterNotNull()
 			?.joinToString()
 			?.takeUnless { it.isEmpty() }
-		return manga.copy(
+		val details = manga.copy(
 			publicUrl = getPublicUrl(jo),
 			altTitles = collectAltTitles(jo),
 			description = jo.getStringOrNull("description"),
@@ -149,6 +192,13 @@ internal class WaMangaParser(
 				)
 			},
 		)
+		val resolved = details.withAvailableCover()
+		val large = resolved.largeCoverUrl
+		return if (large == null || large == resolved.coverUrl || doesFileExist(large)) {
+			resolved
+		} else {
+			resolved.copy(largeCoverUrl = resolved.coverUrl)
+		}
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
@@ -237,5 +287,7 @@ internal class WaMangaParser(
 			"на", "способности", "существа", "тело",
 			"цвете",
 		)
+
+		private const val COVER_PROBE_CONCURRENCY = 4
 	}
 }

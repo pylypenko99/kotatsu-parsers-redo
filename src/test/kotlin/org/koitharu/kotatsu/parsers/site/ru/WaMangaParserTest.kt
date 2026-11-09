@@ -8,6 +8,7 @@ import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.CsvSource
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -94,8 +95,67 @@ internal class WaMangaParserTest {
 		assertEquals("Драма".toTitleCase(), option.title)
 	}
 
+	@org.junit.jupiter.api.Test
+	fun deadCoverFallsBackToLiveBanner() = runTest {
+		val parser = WaMangaParser(
+			TestContext(
+				{ path -> if (path == "/api/v1/manga") COVER_JSON else error("Unexpected request: $path") },
+				headStatus = { url -> if (url.endsWith("cover.webp")) 404 else 200 },
+			),
+		)
+
+		val manga = parser.getListPage(1, SortOrder.UPDATED, MangaListFilter.EMPTY).single()
+
+		assertEquals("https://wamanga.ru/app/uploads/dead1/banner.webp", manga.coverUrl)
+		assertEquals(manga.coverUrl, manga.largeCoverUrl)
+	}
+
+	@org.junit.jupiter.api.Test
+	fun deadCoverWithoutLiveBannerIsNulls() = runTest {
+		val parser = WaMangaParser(
+			TestContext(
+				{ path -> if (path == "/api/v1/manga") COVER_JSON else error("Unexpected request: $path") },
+				headStatus = { 404 },
+			),
+		)
+
+		val manga = parser.getListPage(1, SortOrder.UPDATED, MangaListFilter.EMPTY).single()
+
+		assertNull(manga.coverUrl)
+		assertNull(manga.largeCoverUrl)
+	}
+
+	@org.junit.jupiter.api.Test
+	fun deadBannerFallsBackToCoverInDetails() = runTest {
+		val detailsJson = COVER_JSON.removePrefix("[").removeSuffix("]")
+		val parser = WaMangaParser(
+			TestContext(
+				{ path ->
+					when (path) {
+						"/api/v1/manga" -> COVER_JSON
+						"/api/v1/manga/dead1" -> detailsJson
+						"/api/v1/manga/dead1/chapters" -> "[]"
+						else -> error("Unexpected request: $path")
+					}
+				},
+				headStatus = { url -> if (url.endsWith("banner.webp")) 404 else 200 },
+			),
+		)
+		val listed = parser.getListPage(1, SortOrder.UPDATED, MangaListFilter.EMPTY).single()
+
+		val details = parser.getDetails(listed)
+
+		assertEquals("https://wamanga.ru/app/uploads/dead1/cover.webp", details.largeCoverUrl)
+		assertEquals(details.coverUrl, details.largeCoverUrl)
+	}
+
+	private val COVER_JSON =
+		"""[{"id":"dead1","slug":"sample-title","title":"Sample title","type":"manga",""" +
+			""""coverUrl":"/app/uploads/dead1/cover.webp","imageUrl":"/app/uploads/dead1/banner.webp"}]"""
+
 	private class TestContext(
 		private val responder: (path: String) -> String,
+		private val headStatus: (url: String) -> Int = { 200 },
 		private val recorder: (okhttp3.HttpUrl) -> Unit = {},
 	) : MangaLoaderContext() {
 		override val cookieJar: CookieJar = CookieJar.NO_COOKIES
@@ -103,12 +163,19 @@ internal class WaMangaParserTest {
 			.addInterceptor { chain ->
 				val request = chain.request()
 				recorder(request.url)
+				val isHead = request.method == "HEAD"
+				val code = if (isHead) headStatus(request.url.toString()) else 200
+				val body = if (isHead) {
+					ByteArray(0).toResponseBody(null)
+				} else {
+					responder(request.url.encodedPath).toResponseBody("application/json".toMediaType())
+				}
 				Response.Builder()
 					.request(request)
 					.protocol(Protocol.HTTP_1_1)
-					.code(200)
+					.code(code)
 					.message("OK")
-					.body(responder(request.url.encodedPath).toResponseBody("application/json".toMediaType()))
+					.body(body)
 					.build()
 			}
 			.build()
