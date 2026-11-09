@@ -36,6 +36,7 @@ internal class DesuMeParser(context: MangaLoaderContext) :
     override val filterCapabilities: MangaListFilterCapabilities
         get() = MangaListFilterCapabilities(
             isMultipleTagsSupported = true,
+            isTagsExclusionSupported = true,
             isSearchSupported = true,
         )
 
@@ -49,6 +50,12 @@ internal class DesuMeParser(context: MangaLoaderContext) :
 
     private val tagsCache = suspendLazy(initializer = ::fetchTags)
 
+    // The catalog is HTML-only: the JSON mirror /api/manga/catalog ignores every filter
+    // except page/limit (it even swallows unknown parameter names), while /manga/ honors
+    // order_by (updated|name|popular|id, no ascending variants), kinds and genres —
+    // "<id>-<slug>" to include, "<id>-!<slug>" to exclude, comma-separated (AND).
+    // There is no status filter: the `status=` parameter emitted by the site's own JS
+    // is silently ignored by the server.
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         val query = filter.query?.trim().orEmpty()
         if (query.isNotEmpty()) {
@@ -67,8 +74,9 @@ internal class DesuMeParser(context: MangaLoaderContext) :
             if (order != SortOrder.UPDATED) {
                 addQueryParameter("order_by", getSortKey(order))
             }
-            if (filter.tags.isNotEmpty()) {
-                addQueryParameter("genres", filter.tags.joinToString(",") { it.key })
+            val genres = buildGenresParam(filter.tags, filter.tagsExclude)
+            if (genres.isNotEmpty()) {
+                addQueryParameter("genres", genres)
             }
         }.build()
         return parseCatalog(webClient.httpGet(url).parseHtml())
@@ -244,6 +252,24 @@ internal class DesuMeParser(context: MangaLoaderContext) :
     private fun Element.info(key: String): String? = select(".animeInfo dl").firstOrNull {
         it.selectFirst("dt")?.text() == "$key:"
     }?.selectFirst("dd")?.textOrNull()
+
+    // Tag keys look like "<genreId>-<slug>"; excluded genres become "<genreId>-!<slug>".
+    internal fun buildGenresParam(include: Set<MangaTag>, exclude: Set<MangaTag>): String =
+        buildString {
+            for (tag in include) {
+                if (isNotEmpty()) append(',')
+                append(tag.key)
+            }
+            for (tag in exclude) {
+                val dash = tag.key.indexOf('-')
+                if (isNotEmpty()) append(',')
+                if (dash >= 0) {
+                    append(tag.key, 0, dash + 1).append('!').append(tag.key, dash + 1, tag.key.length)
+                } else {
+                    append('!').append(tag.key)
+                }
+            }
+        }
 
     private fun getSortKey(sortOrder: SortOrder) =
         when (sortOrder) {

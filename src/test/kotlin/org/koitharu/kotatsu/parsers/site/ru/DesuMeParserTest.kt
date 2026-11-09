@@ -6,7 +6,10 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.koitharu.kotatsu.parsers.MangaLoaderContextMock
+import org.koitharu.kotatsu.parsers.model.MangaListFilter
 import org.koitharu.kotatsu.parsers.model.MangaParserSource
+import org.koitharu.kotatsu.parsers.model.MangaTag
+import org.koitharu.kotatsu.parsers.model.SortOrder
 import org.koitharu.kotatsu.parsers.util.generateUid
 import org.koitharu.kotatsu.test_util.mangaOf
 
@@ -26,5 +29,26 @@ internal class DesuMeParserTest {
         assertTrue(details.url.endsWith(".2602/"))
         assertTrue(details.publicUrl.endsWith(".2602/"))
         assertFalse(details.chapters.isNullOrEmpty())
+    }
+
+    @Test
+    fun genresParamEncodesExclusions() {
+        val parser = DesuMeParser(MangaLoaderContextMock)
+        val include = setOf(MangaTag(title = "Т1", key = "90-Dementia", source = parser.source))
+        val exclude = setOf(MangaTag(title = "Т2", key = "64-Vampire", source = parser.source))
+
+        val param = parser.buildGenresParam(include, exclude)
+
+        assertEquals("90-Dementia,64-!Vampire", param)
+    }
+
+    @Test
+    fun listCatalogReturnsEntries() = runTest {
+        val parser = DesuMeParser(MangaLoaderContextMock)
+
+        val list = parser.getListPage(1, SortOrder.UPDATED, MangaListFilter.EMPTY)
+
+        assertTrue(list.size >= 10, "Catalog page should not be empty")
+        assertTrue(list.all { it.url.matches(Regex("""/manga/[a-z0-9-]+\.\d+/""")) })
     }
 }
