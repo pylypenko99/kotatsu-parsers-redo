@@ -14,35 +14,80 @@ import java.util.*
 @MangaSourceParser("WAMANGA", "WaManga", "ru", type = ContentType.MANGA)
 internal class WaMangaParser(
 	context: MangaLoaderContext,
-) : PagedMangaParser(context, MangaParserSource.WAMANGA, pageSize = 20) {
+) : PagedMangaParser(context, MangaParserSource.WAMANGA, pageSize = 24) {
 
 	override val configKeyDomain = ConfigKey.Domain("wamanga.ru")
 
-	// The API returns the catalog in alphabetical order; no server-side sorting.
-	override val availableSortOrders: Set<SortOrder> = EnumSet.of(SortOrder.ALPHABETICAL)
+	// Server-side sorting: /api/v1/manga accepts sortKey in
+	// createdAt | updatedAt | publicDate | views | likes | alphabetical | chapters (anything else is a 400).
+	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
+		SortOrder.UPDATED,
+		SortOrder.UPDATED_ASC,
+		SortOrder.POPULARITY,
+		SortOrder.POPULARITY_ASC,
+		SortOrder.RATING,
+		SortOrder.RATING_ASC,
+		SortOrder.NEWEST,
+		SortOrder.NEWEST_ASC,
+		SortOrder.ALPHABETICAL,
+		SortOrder.ALPHABETICAL_DESC,
+	)
 
 	override val filterCapabilities: MangaListFilterCapabilities
 		get() = MangaListFilterCapabilities(
 			isSearchSupported = true,
+			isSearchWithFiltersSupported = true,
+			isMultipleTagsSupported = true,
+			isTagsExclusionSupported = true,
+			isYearSupported = true,
+			isYearRangeSupported = true,
 		)
 
-	override suspend fun getFilterOptions() = MangaListFilterOptions()
+	// The API has no genres endpoint (GET /api/v1/genres -> 404) and the catalog input is free text,
+	// so tags are the raw site strings. The site's tag data is messy (500+ variants with typos and
+	// split words), so the filter offers the tags that occur on 10+ of the ~2400 titles; every entry
+	// still keeps its verbatim tags, which is what the server matches by exact string.
+	override suspend fun getFilterOptions() = MangaListFilterOptions(
+		availableTags = GENRES.map { genreTag(it) }.toSet(),
+	)
 
 	private fun apiUrl() = "https://${domain}/api/v1"
 
 	private fun getPublicUrl(jo: JSONObject) = "https://$domain/${jo.getString("type")}/${jo.getString("slug")}"
 
+	private fun sortKey(order: SortOrder): Pair<String, Boolean> = when (order) {
+		SortOrder.UPDATED, SortOrder.UPDATED_ASC -> "updatedAt" to (order == SortOrder.UPDATED)
+		SortOrder.POPULARITY, SortOrder.POPULARITY_ASC -> "views" to (order == SortOrder.POPULARITY)
+		SortOrder.RATING, SortOrder.RATING_ASC -> "likes" to (order == SortOrder.RATING)
+		SortOrder.NEWEST, SortOrder.NEWEST_ASC -> "createdAt" to (order == SortOrder.NEWEST)
+		SortOrder.ALPHABETICAL, SortOrder.ALPHABETICAL_DESC -> "alphabetical" to (order == SortOrder.ALPHABETICAL_DESC)
+		else -> "updatedAt" to true
+	}
+
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-		val offset = (page - 1) * pageSize
+		val (key, descending) = sortKey(order)
+		val yearFrom = filter.year.takeIf { it > 0 } ?: filter.yearFrom.takeIf { it > 0 } ?: 0
+		val yearTo = filter.year.takeIf { it > 0 } ?: filter.yearTo.takeIf { it > 0 } ?: 0
 		val url = buildString {
 			append(apiUrl())
-			append("/manga?limit=")
-			append(pageSize)
-			append("&offset=")
-			append(offset)
+			append("/manga?limit=").append(pageSize)
+			append("&offset=").append((page - 1) * pageSize)
+			append("&sortKey=").append(key)
+			append("&sortDescending=").append(descending)
 			filter.query?.takeIf { it.isNotEmpty() }?.let {
-				append("&query=")
-				append(it.urlEncoded())
+				append("&query=").append(it.urlEncoded())
+			}
+			for (tag in filter.tags) {
+				append("&genres=").append(tag.key.urlEncoded())
+			}
+			for (tag in filter.tagsExclude) {
+				append("&excludedGenres=").append(tag.key.urlEncoded())
+			}
+			if (yearFrom > 0) {
+				append("&releaseYearFrom=").append(yearFrom)
+			}
+			if (yearTo > 0) {
+				append("&releaseYearTo=").append(yearTo)
 			}
 		}
 		return webClient.httpGet(url).parseJsonArray().mapJSON { parseManga(it) }
@@ -131,20 +176,66 @@ internal class WaMangaParser(
 			if (name.isEmpty()) {
 				null
 			} else {
-				MangaTag(
-					title = name.toTitleCase(sourceLocale),
-					key = name,
-					source = source,
-				)
+				genreTag(name)
 			}
 		}.orEmpty()
 	}
 
+	private fun genreTag(name: String) = MangaTag(
+		title = name.toTitleCase(sourceLocale),
+		key = name,
+		source = source,
+	)
+
+	// API statuses: ongoing, completed, hiatus, cancelled, unknown, abandoned, announced.
 	private fun parseState(status: String?) = when (status?.lowercase(sourceLocale)) {
 		"ongoing" -> MangaState.ONGOING
 		"finished", "completed" -> MangaState.FINISHED
-		"abandoned" -> MangaState.ABANDONED
-		"paused", "frozen" -> MangaState.PAUSED
+		"abandoned", "cancelled" -> MangaState.ABANDONED
+		"paused", "frozen", "hiatus" -> MangaState.PAUSED
+		"announced" -> MangaState.UPCOMING
 		else -> null
+	}
+
+	private companion object {
+		val GENRES: Set<String> = setOf(
+			"16+", "18+", "Алхимия", "Антигерой",
+			"Апокалипсис", "Аристократия", "Армия", "Артефакты",
+			"Безумие", "Боги", "Боевик", "Боевые",
+			"Боевые искусства", "Бои", "Бои на мечах", "Борьба",
+			"Борьба за власть", "Брат и сестра", "Будущее", "Вампиры",
+			"Веб", "Видеоигры", "Владыка демонов", "Военные",
+			"Война", "Волшебники", "Волшебники / маги", "Волшебные",
+			"Волшебные существа", "Воспоминания", "Воспоминания из другого мира", "Выживание",
+			"ГГ", "ГГ женщина", "ГГ имба", "ГГ мужчина",
+			"Гарем", "Гг женщина", "Героическое фэнтези", "Гильдии",
+			"Гоблины", "Горничные", "Демоны", "Детектив",
+			"Дзёсэй", "Драконы", "Драма", "Дружба",
+			"Жестокий", "Жестокий мир", "Животные компаньоны", "Зверолюди",
+			"Игра", "Игровые элементы", "Империи", "Исекай",
+			"История", "Квесты", "Комедия", "Культивирование",
+			"Легендарное оружие", "Магическая академия", "Магия", "Манга",
+			"Мафия", "Месть", "Мистика", "Монстры",
+			"Музыка", "Мурим", "Навыки", "Навыки / способности",
+			"Насилие", "Насилие / жестокость", "Наёмники", "Нежить",
+			"Огнестрельное оружие", "Отношения", "Офисные работники", "Повседневность",
+			"Подземелья", "Политика", "Полиция", "Преступники / Криминал",
+			"Преступники / криминал", "Призраки / Духи", "Приключения", "Психология",
+			"Путешествие во времени", "Работа", "Рабы", "Разумные расы",
+			"Ранги силы", "Регрессия", "Реинкарнация", "Романтика",
+			"Рыцари", "Сверхъестественное", "Система", "Скрытие личности",
+			"Спасение мира", "Спорт", "Спортивное", "Спортивное тело",
+			"Средневековье", "Супер сила", "Сэйнэн", "Сёдзё",
+			"Сёнэн", "Трагедия", "Триллер", "Ужасы",
+			"Умный", "Умный ГГ", "Учитель", "Фантастика",
+			"Философия", "Фэнтези", "Хентай", "Холодное оружие",
+			"Шантаж", "Школа", "Экшен", "Элементы юмора",
+			"Эльфы", "Эротика", "Этти", "Япония",
+			"власть", "другого", "женщина", "жестокость",
+			"за", "из", "искусства", "маги",
+			"мечах", "мир", "мира", "мужчина",
+			"на", "способности", "существа", "тело",
+			"цвете",
+		)
 	}
 }

@@ -16,6 +16,9 @@ import org.koitharu.kotatsu.parsers.bitmap.Bitmap
 import org.koitharu.kotatsu.parsers.model.MangaListFilter
 import org.koitharu.kotatsu.parsers.model.MangaSource
 import org.koitharu.kotatsu.parsers.model.SortOrder
+import org.koitharu.kotatsu.parsers.model.MangaParserSource
+import org.koitharu.kotatsu.parsers.model.MangaTag
+import org.koitharu.kotatsu.parsers.util.toTitleCase
 
 internal class WaMangaParserTest {
 
@@ -29,14 +32,14 @@ internal class WaMangaParserTest {
 		val mangaJson = """
 			{"id":"sample-id","slug":"sample-title","title":"Sample title","type":"$type"}
 		""".trimIndent()
-		val parser = WaMangaParser(TestContext { path ->
+		val parser = WaMangaParser(TestContext(responder = { path ->
 			when (path) {
 				"/api/v1/manga" -> "[$mangaJson]"
 				"/api/v1/manga/sample-id" -> mangaJson
 				"/api/v1/manga/sample-id/chapters" -> "[]"
 				else -> error("Unexpected request: $path")
 			}
-		})
+		}))
 
 		val manga = parser.getListPage(1, SortOrder.ALPHABETICAL, MangaListFilter.EMPTY).single()
 		assertEquals(expectedUrl, manga.publicUrl)
@@ -45,13 +48,61 @@ internal class WaMangaParserTest {
 		assertEquals(expectedUrl, parser.getDetails(cachedManga).publicUrl)
 	}
 
+	@org.junit.jupiter.api.Test
+	fun listPageSendsSortAndFilterParameters() = runTest {
+		val requests = mutableListOf<okhttp3.HttpUrl>()
+		val parser = WaMangaParser(TestContext({ path -> "[]" }) { requests.add(it) })
+		val filter = MangaListFilter(
+			query = "Механик",
+			tags = setOf(MangaTag("Драма", "Драма", MangaParserSource.WAMANGA)),
+			tagsExclude = setOf(MangaTag("Эротика", "Эротика", MangaParserSource.WAMANGA)),
+			year = 2024,
+		)
+
+		parser.getListPage(3, SortOrder.POPULARITY_ASC, filter)
+
+		val url = requests.single()
+		assertEquals("/api/v1/manga", url.encodedPath)
+		assertEquals("24", url.queryParameter("limit"))
+		assertEquals("48", url.queryParameter("offset"))
+		assertEquals("views", url.queryParameter("sortKey"))
+		assertEquals("false", url.queryParameter("sortDescending"))
+		assertEquals("Механик", url.queryParameter("query"))
+		assertEquals(listOf("Драма"), url.queryParameterValues("genres"))
+		assertEquals(listOf("Эротика"), url.queryParameterValues("excludedGenres"))
+		assertEquals("2024", url.queryParameter("releaseYearFrom"))
+		assertEquals("2024", url.queryParameter("releaseYearTo"))
+	}
+
+	@org.junit.jupiter.api.Test
+	fun alphabeticalSortIsAscending() = runTest {
+		val requests = mutableListOf<okhttp3.HttpUrl>()
+		val parser = WaMangaParser(TestContext({ path -> "[]" }) { requests.add(it) })
+
+		parser.getListPage(1, SortOrder.ALPHABETICAL, MangaListFilter.EMPTY)
+
+		val url = requests.single()
+		assertEquals("alphabetical", url.queryParameter("sortKey"))
+		assertEquals("false", url.queryParameter("sortDescending"))
+	}
+
+	@org.junit.jupiter.api.Test
+	fun filterOptionsMatchEntryTagDerivation() = runTest {
+		val parser = WaMangaParser(TestContext({ path -> "[]" }))
+		val options = parser.getFilterOptions()
+		val option = options.availableTags.first { it.key == "Драма" }
+		assertEquals("Драма".toTitleCase(), option.title)
+	}
+
 	private class TestContext(
 		private val responder: (path: String) -> String,
+		private val recorder: (okhttp3.HttpUrl) -> Unit = {},
 	) : MangaLoaderContext() {
 		override val cookieJar: CookieJar = CookieJar.NO_COOKIES
 		override val httpClient: OkHttpClient = OkHttpClient.Builder()
 			.addInterceptor { chain ->
 				val request = chain.request()
+				recorder(request.url)
 				Response.Builder()
 					.request(request)
 					.protocol(Protocol.HTTP_1_1)
